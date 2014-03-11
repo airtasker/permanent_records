@@ -51,9 +51,9 @@ module PermanentRecords
         # error will be raised if the record isn't valid. (This prevents reviving records that
         # disregard validation constraints,)
         if PermanentRecords.should_ignore_validations?(force)
-          value == nil ? record.save! : record.save!(:validate => false)
+          record.save!(:validate => false)
         else
-          record.save!
+          value == nil ? record.save! : record.save!(:validate => false)
         end
         @attributes, @attributes_cache = record.attributes, record.attributes
         # workaround for active_record >= 3.2.0: re-wrap values of serialized attributes
