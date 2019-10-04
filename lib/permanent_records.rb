@@ -1,40 +1,47 @@
+# PermanentRecords works with ActiveRecord to set deleted_at columns with a
+# timestamp reflecting when a record was 'deleted' instead of actually deleting
+# the record. All dependent records and associations are treated exactly as
+# you'd expect: If there's a deleted_at column then the record is preserved,
+# otherwise it's deleted.
 module PermanentRecords
-
   # This module defines the public api that you can
   # use in your model instances.
   #
   # * is_permanent? #=> true/false, depending if you have a deleted_at column
   # * deleted?      #=> true/false, depending if you've called .destroy
-  # * destroy       #=> sets deleted_at, your record is now in the .destroyed scope
+  # * destroy       #=> sets deleted_at, your record is now in
+  #                     the .destroyed scope
   # * revive        #=> undo the destroy
-  module ActiveRecord
+  module ActiveRecord # rubocop:disable Metrics/ModuleLength
     def self.included(base)
-
       base.extend Scopes
       base.extend IsPermanent
 
       base.instance_eval do
         define_model_callbacks :revive
-
-        before_revive :revive_destroyed_dependent_records
       end
     end
 
-    def is_permanent?
+    def is_permanent? # rubocop:disable Style/PredicateName
       respond_to?(:deleted_at)
     end
 
     def deleted?
       if is_permanent?
-        !!deleted_at
+        !!deleted_at # rubocop:disable Style/DoubleNegation
       else
         destroyed?
       end
     end
 
-    def revive(validate = nil)
+    def revive(options = nil)
       with_transaction_returning_status do
-        run_callbacks(:revive) { set_deleted_at(nil, validate) }
+        if PermanentRecords.should_revive_parent_first?(options)
+          revival.reverse
+        else
+          revival
+        end.each { |p| p.call(options) }
+
         self
       end
     end
@@ -51,120 +58,150 @@ module PermanentRecords
 
     private
 
+    def revival # rubocop:disable Metrics/MethodLength
+      [
+        lambda do |validate|
+          revive_destroyed_dependent_records(validate)
+        end,
+        lambda do |validate|
+          run_callbacks(:revive) do
+            set_deleted_at(nil, validate)
+            # increment all associated counters for counter cache
+            each_counter_cache do |assoc_class, counter_cache_column, assoc_id|
+              assoc_class.increment_counter counter_cache_column, assoc_id
+            end
+            true
+          end
+        end
+      ]
+    end
+
+    def get_deleted_record # rubocop:disable Style/AccessorMethodName
+      self.class.unscoped.find(id)
+    end
+
+    # rubocop:disable Metrics/MethodLength
     def set_deleted_at(value, force = nil)
       return self unless is_permanent?
-      record = self.class.unscoped.find(id)
+      record = get_deleted_record
       record.deleted_at = value
       begin
-        # we call save! instead of update_attribute so an ActiveRecord::RecordInvalid
-        # error will be raised if the record isn't valid. (This prevents reviving records that
-        # disregard validation constraints,)
+        # we call save! instead of update_attribute so an
+        # ActiveRecord::RecordInvalid error will be raised if the record isn't
+        # valid. (This prevents reviving records that disregard validation
+        # constraints,)
         if PermanentRecords.should_ignore_validations?(force)
-          record.save!(:validate => false)
+          record.save(validate: false)
         else
           value == nil ? record.save! : record.save!(:validate => false)
         end
-        if ::Gem::Version.new(::ActiveRecord::VERSION::STRING) < ::Gem::Version.new('4.2.0')
-          @attributes = record.attributes
-          @attributes_cache = record.attributes.except(record.class.serialized_attributes.keys)
-          # workaround for active_record >= 3.2.0: re-wrap values of serialized attributes
-          # (record.attributes returns the plain values but in the instance variables they are expected to be wrapped)
-          if defined?(::ActiveRecord::AttributeMethods::Serialization::Attribute)
-            serialized_attribute_class = ::ActiveRecord::AttributeMethods::Serialization::Attribute
-            self.class.serialized_attributes.each do |key, coder|
-              if @attributes.key?(key)
-                @attributes[key] = serialized_attribute_class.new(coder, @attributes[key], :unserialized)
-              end
-            end
-          end
-        else # AR >= 4.2.0
-          @attributes = record.instance_variable_get('@attributes')
-        end
-      rescue Exception => e
-        # trigger dependent record destruction (they were revived before this record,
-        # which cannot be revived due to validations)
+
+        @attributes = record.instance_variable_get('@attributes')
+      rescue => e
+        # trigger dependent record destruction (they were revived before this
+        # record, which cannot be revived due to validations)
         record.destroy
         raise e
       end
     end
 
-    def destroy_with_permanent_records(force = nil)
-      run_callbacks(:destroy) do
-        deleted? || new_record? ? save : set_deleted_at(Time.now, force)
+    def each_counter_cache
+      _reflections.each do |name, reflection|
+        association = respond_to?(name.to_sym) ? send(name.to_sym) : nil
+        next if association.nil?
+        next unless reflection.belongs_to? && reflection.counter_cache_column
+
+        associated_class = association.class
+
+        yield(associated_class,
+              reflection.counter_cache_column,
+              send(reflection.foreign_key))
       end
-      self
     end
 
-    def revive_destroyed_dependent_records
-      self.class.reflections.select do |name, reflection|
-        'destroy' == reflection.options[:dependent].to_s && reflection.klass.is_permanent?
-      end.each do |name, reflection|
-        cardinality = reflection.macro.to_s.gsub('has_', '')
-        if cardinality == 'many'
-          records = send(name).unscoped.where(
-            [
-              "#{reflection.quoted_table_name}.deleted_at > ?" +
-              " AND " +
-              "#{reflection.quoted_table_name}.deleted_at < ?",
-              deleted_at - PermanentRecords.dependent_record_window,
-              deleted_at + PermanentRecords.dependent_record_window
-            ]
-          )
-        elsif cardinality == 'one' or cardinality == 'belongs_to'
-          self.class.unscoped do
-            records = [] << send(name)
+    def destroy_with_permanent_records(force = nil)
+      run_callbacks(:destroy) do
+        if deleted? || new_record?
+          save
+        else
+          set_deleted_at(Time.now, force)
+          # decrement all associated counters for counter cache
+          each_counter_cache do |assoc_class, counter_cache_column, assoc_id|
+            assoc_class.decrement_counter counter_cache_column, assoc_id
           end
         end
-        [records].flatten.compact.each do |dependent|
-          dependent.revive
-        end
+        true
+      end
+      deleted? ? self : false
+    end
 
-        # and update the reflection cache
-        send(name, :reload)
+    def add_record_window(_request, name, reflection)
+      send(name).unscope(where: :deleted_at).where(
+        [
+          "#{reflection.quoted_table_name}.deleted_at > ?" \
+          ' AND ' \
+          "#{reflection.quoted_table_name}.deleted_at < ?",
+          deleted_at - PermanentRecords.dependent_record_window,
+          deleted_at + PermanentRecords.dependent_record_window
+        ]
+      )
+    end
+
+    # TODO: Feel free to refactor this without polluting the ActiveRecord
+    # namespace.
+    # rubocop:disable Metrics/AbcSize
+    def revive_destroyed_dependent_records(force = nil)
+      destroyed_dependent_relations.each do |relation|
+        relation.to_a.each { |destroyed_dependent_record| destroyed_dependent_record.try(:revive, force) }
+      end
+      reload
+    end
+
+    def destroyed_dependent_relations
+      PermanentRecords.dependent_permanent_reflections(self.class).map do |name, relation|
+        cardinality = relation.macro.to_s.gsub('has_', '').to_sym
+        case cardinality
+        when :many
+          if deleted_at
+            add_record_window(send(name), name, relation)
+          else
+            send(name).unscope(where: :deleted_at)
+          end
+        when :one, :belongs_to
+          self.class.unscoped { Array(send(name)) }
+        end
       end
     end
 
     def attempt_notifying_observers(callback)
-      begin
-        notify_observers(callback)
-      rescue NoMethodError => e
-        # do nothing: this model isn't being observed
-      end
+      notify_observers(callback)
+    rescue NoMethodError # rubocop:disable Lint/HandleExceptions
+      # do nothing: this model isn't being observed
     end
 
-    # return the records corresponding to an association with the `:dependent => :destroy` option
-    def get_dependent_records
-      dependent_records = {}
-
+    # return the records corresponding to an association with the `:dependent
+    # => :destroy` option
+    def dependent_record_ids
       # check which dependent records are to be destroyed
-      klass = self.class
-      klass.reflections.each do |key, reflection|
-        if reflection.options[:dependent] == :destroy
-          next unless records = self.send(key) # skip if there are no dependent record instances
-          if records.respond_to? :size
-            next unless records.size > 0 # skip if there are no dependent record instances
-          else
-            records = [] << records
-          end
-          dependent_record = records.first
-          next if dependent_record.nil?
-          dependent_records[dependent_record.class] = records.map(&:id)
-        end
+      PermanentRecords.dependent_reflections(self.class)
+                      .reduce({}) do |records, (key, _)|
+        found = Array(send(key)).compact
+        next records if found.empty?
+        records.update found.first.class => found.map(&:id)
       end
-      dependent_records
     end
 
-    # If we force the destruction of the record, we will need to force the destruction of dependent records if the
-    # user specified `:dependent => :destroy` in the model.
-    # By default, the call to super/destroy_with_permanent_records (i.e. the &block param) will only soft delete
-    # the dependent records; we keep track of the dependent records
-    # that have `:dependent => :destroy` and call destroy(force) on them after the call to super
-    def permanently_delete_records_after(&block)
-      dependent_records = get_dependent_records
-      result = block.call
-      if result
-        permanently_delete_records(dependent_records)
-      end
+    # If we force the destruction of the record, we will need to force the
+    # destruction of dependent records if the user specified `:dependent =>
+    # :destroy` in the model.  By default, the call to
+    # super/destroy_with_permanent_records (i.e. the &block param) will only
+    # soft delete the dependent records; we keep track of the dependent records
+    # that have `:dependent => :destroy` and call destroy(force) on them after
+    # the call to super
+    def permanently_delete_records_after(&_block)
+      dependent_records = dependent_record_ids
+      result = yield
+      permanently_delete_records(dependent_records) if result
       result
     end
 
@@ -172,11 +209,8 @@ module PermanentRecords
     def permanently_delete_records(dependent_records)
       dependent_records.each do |klass, ids|
         ids.each do |id|
-          record = begin
-            klass.unscoped.find id
-          rescue ::ActiveRecord::RecordNotFound
-            next # the record has already been deleted, possibly due to another association with `:dependent => :destroy`
-          end
+          record = klass.unscoped.where(klass.primary_key => id).first
+          next unless record
           record.deleted_at = nil
           record.destroy(:force)
         end
@@ -184,6 +218,7 @@ module PermanentRecords
     end
   end
 
+  # ActiveRelation scopes
   module Scopes
     def deleted
       where arel_table[:deleted_at].not_eq(nil)
@@ -194,22 +229,27 @@ module PermanentRecords
     end
   end
 
+  # Included into ActiveRecord for all models
   module IsPermanent
-    def is_permanent?
-      columns.detect {|c| 'deleted_at' == c.name}
+    def is_permanent? # rubocop:disable Style/PredicateName
+      columns.detect { |c| 'deleted_at' == c.name }
     end
   end
 
   def self.should_force_destroy?(force)
-    if Hash === force
+    if force.is_a?(Hash)
       force[:force]
     else
       :force == force
     end
   end
 
+  def self.should_revive_parent_first?(order)
+    order.is_a?(Hash) && true == order[:reverse]
+  end
+
   def self.should_ignore_validations?(force)
-    Hash === force && false == force[:validate]
+    force.is_a?(Hash) && false == force[:validate]
   end
 
   def self.dependent_record_window
@@ -219,7 +259,21 @@ module PermanentRecords
   def self.dependent_record_window=(time_value)
     @dependent_record_window = time_value
   end
+
+  def self.dependent_reflections(klass)
+    klass.reflections.select do |_, reflection|
+      # skip if there are no dependent record instances
+      reflection.options[:dependent] == :destroy
+    end
+  end
+
+  def self.dependent_permanent_reflections(klass)
+    dependent_reflections(klass).select do |_name, reflection|
+      reflection.klass.is_permanent?
+    end
+  end
 end
 
-ActiveRecord::Base.send :include, PermanentRecords::ActiveRecord
-
+ActiveSupport.on_load(:active_record) do
+  ActiveRecord::Base.send :include, PermanentRecords::ActiveRecord
+end

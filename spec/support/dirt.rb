@@ -1,4 +1,5 @@
 class Dirt < ActiveRecord::Base
   has_one :hole
-  has_one :earthworm, :dependent => :destroy
+  # validates :hole, presence: true
+  has_one :earthworm, dependent: :destroy
 end
