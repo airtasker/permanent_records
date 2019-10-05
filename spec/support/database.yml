@@ -1,6 +1,7 @@
 test:
-  adapter: sqlite3
-  database: "memory"
+  :adapter: sqlite3
+  :database: ":memory:"
+  :min_messages: ERROR
 # sqlite:
 #   :adapter: sqlite
 #   :database: plugin.sqlite.db
