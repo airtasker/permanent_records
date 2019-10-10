@@ -5,13 +5,7 @@ module HandlePermanentRecordsDestroyedInBelongsToAssociation
     case options[:dependent]
     when :destroy
       target.destroy
-      if target.respond_to?(:soft_destroyed?)
-        raise ActiveRecord::Rollback unless target.soft_destroyed?
-      elsif target.respond_to?(:destroyed?)
-        raise ActiveRecord::Rollback unless target.destroyed?
-      else
-        raise ActiveRecord::Rollback unless target.deleted?
-      end
+      raise ActiveRecord::Rollback if target.respond_to?(:deleted?) && !target.deleted?
     else
       target.send(options[:dependent])
     end
@@ -27,13 +21,7 @@ module HandlePermanentRecordsDestroyedInHasOneAssociation
       when :destroy
         target.destroyed_by_association = reflection
         target.destroy
-        if target.respond_to?(:soft_destroyed?)
-          throw(:abort) unless target.soft_destroyed?
-        elsif target.respond_to?(:destroyed?)
-          throw(:abort) unless target.destroyed?
-        else
-          throw(:abort) unless target.deleted?
-        end
+        throw(:abort) if target.respond_to?(:deleted?) && !target.deleted?
       when :nullify
         target.update_columns(reflection.foreign_key => nil) if target.persisted?
       end
